@@ -1,0 +1,142 @@
+ <!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard Monitor QRIS</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f4f6f9;
+            margin: 0;
+            padding: 20px;
+            color: #333;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        header {
+            margin-bottom: 30px;
+        }
+        h1 { margin: 0; color: #1e3a8a; }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .card {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+        .card h3 { margin: 0 0 10px 0; color: #666; font-size: 14px; text-transform: uppercase; }
+        .card .value { font-size: 24px; font-weight: bold; color: #10b981; }
+        .table-container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }
+        th, td {
+            padding: 12px;
+            border-bottom: 1px solid #edf2f7;
+        }
+        th { background-color: #f8fafc; color: #4a5568; }
+        tr:hover { background-color: #f8fafc; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>QRIS Real-Time Monitor</h1>
+            <p>Memantau data mutasi bersih dari Google Apps Script</p>
+        </header>
+
+        <div class="grid">
+            <div class="card">
+                <h3>Total Pendapatan (Bulan Ini)</h3>
+                <div class="value" id="total-pendapatan">Rp 0</div>
+            </div>
+            <div class="card">
+                <h3>Jumlah Transaksi</h3>
+                <div class="value" id="total-transaksi" style="color: #1e3a8a;">0</div>
+            </div>
+        </div>
+
+        <div class="table-container">
+            <h3>Riwayat Transaksi Masuk</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Waktu Sistem</th>
+                        <th>Tanggal Email</th>
+                        <th>Nominal</th>
+                        <th>Deskripsi</th>
+                    </tr>
+                </thead>
+                <tbody id="data-transaksi">
+                    <tr>
+                        <td colspan="4" style="text-align: center; color: #999;">Memuat data...</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        // Fungsi untuk mengambil data dari API backend server.js
+        async function loadDashboardData() {
+            try {
+                // 1. Ambil data riwayat transaksi
+                const resData = await fetch('/api/transaksi');
+                const transaksi = await resData.json();
+                
+                // 2. Ambil data ringkasan bulanan
+                const resRingkasan = await fetch('/api/ringkasan');
+                const ringkasan = await resRingkasan.json();
+
+                // Update Ringkasan di atas (Ambil data bulan terbaru jika ada)
+                if (ringkasan.length > 0) {
+                    document.getElementById('total-pendapatan').innerText = 'Rp ' + ringkasan[0].total.toLocaleString('id-ID');
+                    document.getElementById('total-transaksi').innerText = ringkasan[0].jumlah_transaksi + ' Transaksi';
+                }
+
+                // Update Tabel Riwayat
+                const tbody = document.getElementById('data-transaksi');
+                if (transaksi.length === 0) {
+                    tbody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: #999;">Belum ada transaksi masuk</td></tr>`;
+                    return;
+                }
+
+                tbody.innerHTML = transaksi.map(t => {
+                    const tglSistem = new Date(t.created_at).toLocaleString('id-ID');
+                    return `
+                        <tr>
+                            <td>${tglSistem}</td>
+                            <td>${t.tanggal}</td>
+                            <td style="color: #10b981; font-weight: bold;">Rp ${t.nominal.toLocaleString('id-ID')}</td>
+                            <td>${t.deskripsi}</td>
+                        </tr>
+                    `;
+                }).join('');
+
+            } catch (error) {
+                console.error("Gagal memuat data dashboard:", error);
+            }
+        }
+
+        // Jalankan saat halaman dibuka
+        loadDashboardData();
+        // Refresh otomatis setiap 10 detik agar kelihatan real-time
+        setInterval(loadDashboardData, 10000);
+    </script>
+</body>
+</html>
