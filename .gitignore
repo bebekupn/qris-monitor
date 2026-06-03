@@ -1,3 +1,6 @@
 node_modules/
 .env
 database.db
+token.json
+credentials.json
+
