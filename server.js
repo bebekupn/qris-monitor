@@ -12,10 +12,15 @@ app.use(express.static('public'));
 // Inisialisasi database
 const db = new sqlite3.Database('./database.db');
 
-// Pastikan tabel-tabel sudah terbuat dengan benar saat server dinyalakan
+// FORCE RESET: Menghapus tabel lama yang strukturnya salah dan membuat ulang secara bersih
 db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS gmail (id INTEGER PRIMARY KEY AUTOINCREMENT, tanggal TEXT, isi TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS transaksi (id INTEGER PRIMARY KEY AUTOINCREMENT, tanggal TEXT, nominal INTEGER, deskripsi TEXT)`);
+  db.run(`DROP TABLE IF EXISTS gmail`);
+  db.run(`DROP TABLE IF EXISTS transaksi`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS gmail (id INTEGER PRIMARY KEY AUTOINCREMENT, id_email TEXT UNIQUE, tanggal TEXT, isi TEXT)`);
+  db.run(`CREATE TABLE IF NOT EXISTS transaksi (id INTEGER PRIMARY KEY AUTOINCREMENT, id_email TEXT UNIQUE, tanggal TEXT, nominal INTEGER, deskripsi TEXT)`);
+  
+  console.log("🔄 DATABASE RESET: Tabel lama dihapus dan diperbarui dengan kolom 'id_email'!");
 });
 
 // Setup Gmail API pakai token lokal
@@ -35,21 +40,21 @@ async function cekEmailMandiri() {
   try {
     const gmail = buatGmailClient();
 
-    // Cari email dari Mandiri
+    // FILTER AMAN: Hanya mengambil email dari Mandiri yang statusnya belum dibaca (is:unread)
     const result = await gmail.users.messages.list({
       userId: 'me',
-      q: 'from:noreply.livin@bankmandiri.co.id',
+      q: 'from:noreply.livin@bankmandiri.co.id is:unread',
       maxResults: 20,
     });
 
     const messages = result.data.messages;
     if (!messages || messages.length === 0) {
-      console.log(`[${new Date().toLocaleString('id-ID')}] Tidak ada email baru dari Mandiri.`);
+      console.log(`[${new Date().toLocaleString('id-ID')}] Tidak ada email baru (unread) dari Mandiri.`);
       await parsnominal();
       return;
     }
 
-    console.log(`[${new Date().toLocaleString('id-ID')}] Ditemukan ${messages.length} email di inbox`);
+    console.log(`[${new Date().toLocaleString('id-ID')}] Ditemukan ${messages.length} email baru yang belum dibaca`);
 
     for (const msg of messages) {
       const detail = await gmail.users.messages.get({
@@ -74,35 +79,36 @@ async function cekEmailMandiri() {
         teks = Buffer.from(payload.body.data, 'base64').toString('utf-8');
       }
 
-      // Simpan ke database antrean sementara (tabel gmail)
+      // Simpan ke database antrean sementara (tabel gmail) menggunakan INSERT OR IGNORE
       await new Promise((resolve) => {
         db.run(
-          "INSERT INTO gmail(tanggal, isi) VALUES (?,?)",
-          [date.toISOString(), teks],
+          "INSERT OR IGNORE INTO gmail(id_email, tanggal, isi) VALUES (?,?,?)",
+          [msg.id, date.toISOString(), teks],
           function (err) {
             if (err) {
-              console.error("❌ Gagal menyimpan email ke DB:", err.message);
-            } else {
-              console.log(`✅ Sukses menyimpan email ke DB Antrean! ID Row: ${this.lastID}`);
+              console.error("❌ Gagal menyimpan email ke DB Antrean:", err.message);
+            } else if (this.changes > 0) {
+              console.log(`✅ Email ID ${msg.id} berhasil masuk antrean lokal.`);
             }
             resolve();
           }
         );
       });
 
-      // Hapus status UNREAD di Gmail agar tidak ditarik berulang kali di polling berikutnya
+      // Tandai sebagai 'SUDAH DIBACA' di server Gmail agar tidak ditarik lagi pada polling menit ke-5 berikutnya
       try {
         await gmail.users.messages.modify({
           userId: 'me',
           id: msg.id,
           requestBody: { removeLabelIds: ['UNREAD'] },
         });
+        console.log(`✉️ Email ID ${msg.id} ditandai sebagai 'Sudah Dibaca' di Gmail.`);
       } catch (e) {
-        // Abaikan jika status gagal diubah (misal karena sudah terbaca secara manual)
+        // Abaikan jika modifikasi label gagal
       }
     }
 
-    // Panggil fungsi parsing setelah semua email berhasil dimasukkan ke antrean
+    // Jalankan pemrosesan teks menjadi nominal transaksi
     await parsnominal();
 
   } catch (err) {
@@ -112,7 +118,7 @@ async function cekEmailMandiri() {
 
 async function parsnominal() {
   try {
-    // 1. Ambil seluruh data dari tabel gmail antrean sementara
+    // 1. Ambil seluruh data antrean dari tabel gmail
     const emails = await new Promise((resolve, reject) => {
       db.all(`SELECT * FROM gmail`, (err, rows) => {
         if (err) reject(err);
@@ -127,17 +133,17 @@ async function parsnominal() {
 
     console.log(`Memulai parsing cerdas untuk ${emails.length} data email...`);
 
-    // 2. Perulangan memproses teks email menggunakan normalisasi format
+    // 2. Perulangan memproses teks email menggunakan teknik normalisasi desimal
     for (let i = 0; i < emails.length; i++) {
       const email = emails[i];
       const teks = email.isi;
       const tanggalEmailRaw = email.tanggal;
 
-      // Regex tajam untuk menangkap susunan angka nominal transaksi setelah simbol uang
+      // Ambil susunan angka setelah tulisan Rp atau IDR
       const matchNominal = teks.match(/Rp\.?\s*([\d.,]+)/i) || teks.match(/IDR\s*([\d.,]+)/i);
 
       if (matchNominal) {
-        let rawNumber = matchNominal[1].trim(); // Contoh hasil tangkapan: "65.000,00" atau "49,452.00"
+        let rawNumber = matchNominal[1].trim(); // Contoh tangkapan: "65.000,00" atau "49,452.00"
 
         // === PROSES NORMALISASI FORMAT INTERNASIONAL KE INDONESIA ===
         // Jika polanya mengandung koma di ribuan dan titik di desimal sen (ex: 49,452.00)
@@ -145,7 +151,7 @@ async function parsnominal() {
           const indexKoma = rawNumber.indexOf(',');
           const indexTitik = rawNumber.indexOf('.');
           if (indexKoma < indexTitik) {
-            // Ubah paksa susunan format: 49,452.00 -> 49.452,00
+            // Tukar posisi agar menjadi format standar Indonesia: 49.452,00
             rawNumber = rawNumber.replace(/\,/g, '_').replace(/\./g, ',').replace(/_/g, '.');
           }
         } 
@@ -153,37 +159,32 @@ async function parsnominal() {
         else if (rawNumber.includes('.') && !rawNumber.includes(',')) {
           const parts = rawNumber.split('.');
           if (parts[1] && parts[1].length === 2) {
-            rawNumber = parts[0] + ',' + parts[1]; // Ubah titik sen menjadi koma sen (,00)
+            rawNumber = parts[0] + ',' + parts[1]; // Ubah titik sen menjadi koma sen
           }
         }
 
         // SEKARANG FORMAT SUDAH PASTI STANDAR INDONESIA (Titik ribuan, Koma sen)
         let cleanNumber = rawNumber;
 
-        // Potong dan buang bagian sen (,00) jika ada di belakang koma utama
-        if (cleanNumber.includes('料')) {
-          // Abaikan, penanganan string koma di bawah
-        }
-        
+        // Potong dan buang bagian pecahan desimal sen (,00) jika ada di belakang koma utama
         if (cleanNumber.includes(',')) {
           const parts = cleanNumber.split(',');
-          // Pastikan string di belakang koma adalah digit sen (berjumlah 2 digit seperti ,00)
           if (parts[1] && (parts[1] === '00' || parts[1].length === 2)) {
-            cleanNumber = parts[0]; // Ambil angka sebelum koma saja
+            cleanNumber = parts[0]; // Ambil angka utama sebelum koma saja
           }
         }
 
-        // Hapus tanda titik ribuan agar tersisa angka murni murni untuk dikonversi
+        // Hapus tanda titik ribuan untuk mendapatkan angka murni Node.js
         const nominal = parseInt(cleanNumber.replace(/\./g, ''), 10);
         
-        // Validasi angka hasil parsing agar tidak memasukkan sampah data Rp 0 atau NaN
+        // Validasi angka agar tidak memasukkan nominal sampah Rp 0 atau NaN
         if (isNaN(nominal) || nominal <= 0) {
           console.log(`⚠️ Hasil parse tidak valid (Rp ${nominal}) pada email ID: ${email.id}. Dilewati.`);
           await new Promise((resolve) => db.run(`DELETE FROM gmail WHERE id = ?`, [email.id], () => resolve()));
           continue;
         }
 
-        // Bersihkan dan rapikan format tanggal untuk SQLite (YYYY-MM-DD)
+        // Rapikan format tanggal untuk SQLite (YYYY-MM-DD)
         let tanggal;
         try {
           tanggal = new Date(tanggalEmailRaw).toISOString().split('T')[0];
@@ -193,30 +194,29 @@ async function parsnominal() {
         
         const deskripsi = "QRIS Mandiri Sukses";
 
-        // 3. Masukkan ke dalam tabel transaksi murni
+        // 3. Masukkan ke dalam tabel transaksi murni (Proteksi UNIQUE id_email agar tidak duplikat)
         await new Promise((resolve) => {
           db.run(
-            `INSERT INTO transaksi (tanggal, nominal, deskripsi) VALUES (?, ?, ?)`,
-            [tanggal, nominal, deskripsi],
+            `INSERT OR IGNORE INTO transaksi (id_email, tanggal, nominal, deskripsi) VALUES (?, ?, ?, ?)`,
+            [email.id_email, tanggal, nominal, deskripsi],
             function (err) {
               if (err) {
                 console.error("❌ Gagal simpan ke tabel transaksi:", err.message);
-              } else {
-                console.log(`💰 [DATABASE TRANSAKSI] Tersimpan: Rp ${nominal.toLocaleString('id-ID')} — ${tanggal}`);
+              } else if (this.changes > 0) {
+                console.log(`💰 [DASHBOARD] Transaksi Baru Masuk: Rp ${nominal.toLocaleString('id-ID')} — ${tanggal}`);
               }
               resolve();
             }
           );
         });
 
-        // 4. Hapus dari antrean email 'gmail' setelah sukses diparsing agar tidak dibaca ganda
+        // 4. Hapus dari antrean email 'gmail' setelah sukses diparsing
         await new Promise((resolve) => {
           db.run(`DELETE FROM gmail WHERE id = ?`, [email.id], () => resolve());
         });
 
       } else {
         console.log(`⚠️ Tidak bisa parse nominal dari email baris ID: ${email.id}. Menghapus sampah antrean...`);
-        // Hapus baris dari antrean jika format email bukan mutasi valid
         await new Promise((resolve) => {
           db.run(`DELETE FROM gmail WHERE id = ?`, [email.id], () => resolve());
         });
@@ -261,5 +261,5 @@ app.get('/api/ringkasan', (req, res) => {
 
 app.listen(process.env.PORT || 3000, () => {
   console.log('Server lokal berjalan di http://localhost:3000');
-  console.log('Polling Gmail setiap 5 menit...');
+  console.log('Polling Gmail aktif dengan Filter Unread...');
 });
